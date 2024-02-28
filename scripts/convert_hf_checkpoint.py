@@ -31,6 +31,8 @@ def convert_hf_checkpoint(
     config = ModelArgs.from_name(model_name)
     print(f"Model config {config.__dict__}")
 
+    from safetensors import safe_open
+
     # Load the json file containing weight mapping
     model_map_json_safetensors = checkpoint_dir / 'model.safetensors.index.json'
     model_map_json_pytorch = checkpoint_dir / "pytorch_model.bin.index.json"
@@ -113,6 +115,9 @@ def convert_hf_checkpoint(
             del final_result[key]
             del final_result[key.replace("wq", "wk")]
             del final_result[key.replace("wq", "wv")]
+    if "output.weight" not in final_result:
+        final_result["output.weight"] = final_result["tok_embeddings.weight"]
+
     print(f"Saving checkpoint to {checkpoint_dir / 'model.pth'}")
     torch.save(final_result, checkpoint_dir / "model.pth")
     if 'llama-3-' in model_name.lower() or 'llama-3.1-' in model_name.lower():
