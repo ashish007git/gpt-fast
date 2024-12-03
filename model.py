@@ -31,6 +31,7 @@ class ModelArgs:
     rope_base: float = 10000
     norm_eps: float = 1e-5
     rope_scaling: Optional[dict] = None
+    sliding_window: Optional[int] = None
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -41,6 +42,8 @@ class ModelArgs:
             self.intermediate_size = find_multiple(n_hidden, 256)
         if self.head_dim is None:
             self.head_dim = self.dim // self.n_head
+
+
 
     @classmethod
     def from_name(cls, name: str):
@@ -56,11 +59,12 @@ class ModelArgs:
             assert len(config[0]) != len(config[1]), name # make sure only one 'best' match
             
         return cls(**transformer_configs[config[0]])
-
+    
 
 transformer_configs = {
     "gemma-2b": dict(dim=2048, vocab_size=256000, n_layer=18, n_head=8, n_local_heads=1, intermediate_size=16384),
     "gemma-7b": dict(dim=3072, vocab_size=256000, n_layer=28, n_head=16, n_local_heads=16, intermediate_size=24576, head_dim=256),
+    "gemma-2-27b": dict(block_size=(32768 + 256), dim=4608, vocab_size=256000, n_layer=46, n_head=32, n_local_heads=16, intermediate_size=36864, head_dim=128, sliding_window=4096),
     "CodeLlama-7b-Python-hf": dict(block_size=16384, vocab_size=32000, n_layer=32, dim = 4096, rope_base=1000000),
     "7B": dict(n_layer=32, n_head=32, dim=4096),
     "13B": dict(n_layer=40, n_head=40, dim=5120),
@@ -108,7 +112,7 @@ class Transformer(nn.Module):
         self.config = config
 
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
-        self.layers = nn.ModuleList(TransformerBlock(config) for _ in range(config.n_layer))
+        self.layers = nn.ModuleList(TransformerBlock(config, i) for i in range(config.n_layer))
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
@@ -124,6 +128,17 @@ class Transformer(nn.Module):
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
         dtype = self.output.weight.dtype
+        mask_dtype = bool # torch.bfloat16
+
+
+        # Setup masks
+        fill_value = -2.3819763e38 if mask_dtype == torch.float or mask_dtype == torch.bfloat16 else 0 
+        self.causal_mask = torch.triu(torch.full((self.max_seq_length, self.max_seq_length), fill_value, dtype=mask_dtype), diagonal=1)
+        if self.config.sliding_window:
+            sliding_window_size = self.config.sliding_window
+            all_ones = torch.full((self.max_seq_length, self.max_seq_length), fill_value).to(mask_dtype)
+            self.sliding_mask = torch.triu(all_ones, -1*sliding_window_size + 1)*torch.tril(all_ones, sliding_window_size - 1)
+        
         # For quantized layers, dtype is encoded in scales
         if hasattr(self.output, "scales"):
             dtype = self.output.scales.dtype
@@ -131,9 +146,10 @@ class Transformer(nn.Module):
             dtype = self.output.scales_and_zeros.dtype
         for b in self.layers:
             b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, self.config.head_dim, dtype)
+            if b.layer_num % 2 == 0 and b.attention.sliding_window:
+                b.sliding_mask = self.sliding_mask 
 
-        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
-        self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
+        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.head_dim, self.config.rope_base, dtype, self.config.rope_scaling)
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
@@ -154,21 +170,26 @@ class Transformer(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: ModelArgs) -> None:
+    def __init__(self, config: ModelArgs, layer_num:int) -> None:
         super().__init__()
-        self.attention = Attention(config)
+        self.layer_num = layer_num 
+        self.attention = Attention(config, layer_num)
         self.feed_forward = FeedForward(config)
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
+        self.post_ffn_norm = RMSNorm(config.dim, config.norm_eps)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
+        self.post_attention_norm = RMSNorm(config.dim, config.norm_eps)
 
     def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
         h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+        h = self.post_attention_norm(h) 
         out = h + self.feed_forward(self.ffn_norm(h))
+        out = self.post_ffn_norm(out)
         return out
 
 
 class Attention(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelArgs, layer_num: int|None):
         super().__init__()
         assert config.dim % config.n_head == 0
 
@@ -182,7 +203,9 @@ class Attention(nn.Module):
         self.head_dim = config.head_dim
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
-        self._register_load_state_dict_pre_hook(self.load_hook)
+        self.layer_num = layer_num
+        self.sliding_window = getattr(config, 'sliding_window')
+        self.sliding_mask = None
 
     def load_hook(self, state_dict, prefix, *args):
         if prefix + "wq.weight" in state_dict:
@@ -211,7 +234,9 @@ class Attention(nn.Module):
 
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+
+        attn_mask = self.sliding_mask if self.sliding_mask and self.layer_num % 2 == 0 else mask
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.n_head * self.head_dim)
 
