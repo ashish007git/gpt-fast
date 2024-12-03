@@ -126,14 +126,15 @@ def _apply_tp_attn(attn: Attention) -> None:
     assert hasattr(attn, "wo")
 
     kv_size = attn.n_local_heads * attn.head_dim
-    _apply_tp_linear(attn.wqkv, "colwise", [attn.dim, kv_size, kv_size])
+    total_head_dim = attn.head_dim * attn.n_head # Gemma2 attn.dim is not equal to attn.heads*head_dim
+    _apply_tp_linear(attn.wqkv, "colwise", [ total_head_dim, kv_size, kv_size]) 
     _apply_tp_linear(attn.wo, "rowwise")
 
     # overwrite
     world_size = _get_world_size()
     attn.n_head = attn.n_head // world_size
     attn.dim = attn.dim // world_size
-    attn.head_dim = attn.dim // attn.n_head
+    # attn.head_dim = attn.dim // attn.n_head # Not applicable for Gemma 2
     attn.n_local_heads = attn.n_local_heads // world_size
 
     attn.register_forward_hook(lambda _module, _input, output: funcol.all_reduce(
