@@ -68,7 +68,9 @@ def convert_hf_checkpoint(
         "model.layers.{}.mlp.up_proj.weight": "layers.{}.feed_forward.w3.weight",
         "model.layers.{}.mlp.down_proj.weight": "layers.{}.feed_forward.w2.weight",
         "model.layers.{}.input_layernorm.weight": "layers.{}.attention_norm.weight",
-        "model.layers.{}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
+        "model.layers.{}.post_attention_layernorm.weight": "layers.{}.post_attention_norm.weight",
+        "model.layers.{}.pre_feedforward_layernorm.weight": "layers.{}.ffn_norm.weight",
+        "model.layers.{}.post_feedforward_layernorm.weight": "layers.{}.post_ffn_norm.weight",
         "model.norm.weight": "norm.weight",
         "lm_head.weight": "output.weight",
     }
