@@ -26,7 +26,7 @@ torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 # Experimental features to reduce compilation times, will be on by default in future
 torch._inductor.config.fx_graph_cache = True 
-torch._functorch.config.enable_autograd_cache = True
+# torch._functorch.config.enable_autograd_cache = True
 
 default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -58,6 +58,8 @@ def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
 
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
     # input_pos: [B, S]
+    # AG: Removing flash attention for prefill
+    # with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)[0]
 
@@ -70,6 +72,7 @@ def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tenso
 def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
+        # AG: Edit flash attention etc. here
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
             next_token, next_prob = decode_one_token(
                 model, cur_token, input_pos, **sampling_kwargs
@@ -146,6 +149,7 @@ def generate(
     interactive: bool,
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
+    benchmark: Optional[bool] = False,
     callback = lambda x: x,
     **sampling_kwargs
 ) -> torch.Tensor:
@@ -156,11 +160,15 @@ def generate(
     is_speculative = draft_model is not None
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(-1)
-    T_new = T + max_new_tokens
-    if interactive:
-        max_seq_length = 350
+    if not benchmark:
+        T_new = T + max_new_tokens
+        if interactive:
+            max_seq_length = 350
+        else: # AGE: Fix it to block size in benchmark mode 
+            max_seq_length = min(T_new, model.config.block_size)
     else:
-        max_seq_length = min(T_new, model.config.block_size)
+        max_seq_length = min( T + max_new_tokens, model.config.block_size)
+        T_new = max_seq_length
 
     device, dtype = prompt.device, prompt.dtype
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
@@ -177,14 +185,19 @@ def generate(
     seq = empty
     input_pos = torch.arange(0, T, device=device)
 
+    #prefill_batch_size=1
+    t_prefill_start = time.perf_counter()
     next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs).clone()
     if is_speculative:
         prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
+    # next_token = next_token.repeat(batch_size/prefill_batch_size)
     seq[:, T] = next_token.squeeze()
+    t_prefill_time = time.perf_counter() - t_prefill_start
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)
 
+    t_generate_start = time.perf_counter()
     if is_speculative:
         input_pos = input_pos.item()  # for speculative decoding easier to keep on host
         while input_pos < T_new - 1:
@@ -204,6 +217,8 @@ def generate(
     else:
         generated_tokens, _ = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
         seq[:, T + 1:] = torch.cat(generated_tokens, dim=-1)
+    t_generate_time = time.perf_counter() - t_generate_start
+    print(f"Time for Sample: {t_prefill_time + t_generate_time}, Prefill time = {t_prefill_time:.2f}, Generate time = {t_generate_time:.2f}")
 
     generate_stats = {
         'accept_counts': accept_counts
@@ -284,6 +299,7 @@ def main(
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
     device=default_device,
+    benchmark: Optional[bool] = True,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -295,6 +311,7 @@ def main(
     global print
     from tp import maybe_init_dist
     rank = maybe_init_dist()
+    print("Rank: ", rank)
     use_tp = rank is not None
     if use_tp:
         if rank != 0:
@@ -319,6 +336,8 @@ def main(
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
+
+    if benchmark: assert isinstance(prompt, int)
 
     if isinstance(prompt, str):
         encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
@@ -395,6 +414,7 @@ def main(
                 callback=callback,
                 temperature=temperature,
                 top_k=top_k,
+                benchmark=benchmark,
             )
             aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
         if i == -1:
@@ -412,7 +432,7 @@ def main(
             # Just displaying the first generation
             if batch_size > 1:
                 print("Only displaying the first generation of the batch")
-            print(tokenizer.decode(y[0].tolist()))
+            # print(tokenizer.decode(y[0].tolist()))
         else:
             print()
         tokens_generated = y.size(-1) - prompt_length
@@ -461,10 +481,11 @@ if __name__ == '__main__':
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
+    parser.add_argument('--benchmark', action='store_true', help='Launch in benchmark mode with fixed prompts, use prompt for max seq len, and use max_new_tokens for generate steps')
 
     args = parser.parse_args()
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device
+        args.speculate_k, args.device, args.benchmark
     )
